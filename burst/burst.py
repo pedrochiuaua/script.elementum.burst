@@ -162,6 +162,18 @@ def search(payload, method="general"):
         provider_names.append(definitions[provider]['name'])
         task = Thread(target=run_provider, args=(provider, payload, method, providers_time, timeout))
         task.start()
+        if method == 'episode':
+            log.info("Searching season pack too")
+            available_providers += 1
+            season_payload = payload.copy()
+            try:
+                del season_payload['episode']
+                del season_payload['absolute_number']
+                season_payload['tmdb_id'] = 0
+            except KeyError:
+                pass
+            task2 = Thread(target=run_provider, args=(provider, season_payload, 'season', providers_time, timeout))
+            task2.start()
 
     total = float(available_providers)
 
@@ -194,6 +206,17 @@ def search(payload, method="general"):
     log.debug("all filtered_results of %d: %s" % (len(filtered_results), repr(filtered_results)))
 
     log.info("Providers returned %d results in %s seconds" % (len(filtered_results), round(time.time() - request_time, 2)))
+
+    if method == 'episode':
+        remove_results = []
+        for r in filtered_results:
+            episode_number = str(re.findall(r"(?i)S\d\dE\d\d",r['name'])).lower()[2:8]
+            searched_season = "{:02d}".format(payload['season'])
+            searched_episode = "{:02d}".format(payload['episode'])
+            if (episode_number != '' and episode_number != 's' + searched_season + 'e' + searched_episode):
+                log.info("Remove %s >>> Title don't match searched episode (%s)" % (r['name'], 'S' + searched_season + 'E' + searched_episode))
+                remove_results.append(r)
+        filtered_results = [r for r in filtered_results if r not in remove_results]
 
     return filtered_results
 
