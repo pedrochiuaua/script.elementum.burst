@@ -4,16 +4,23 @@
 Provider thread methods
 """
 
+from future.utils import PY3, iteritems
+
 import os
 import re
 import json
+import time
 import urllib
-import xbmc
-import xbmcaddon
-from client import Client
+from .client import Client
 from elementum.provider import log, get_setting, set_setting
-from providers.definitions import definitions, longest
-from utils import ADDON_PATH, get_int, clean_size, get_alias
+from .providers.definitions import definitions, longest
+from .utils import ADDON_PATH, get_int, clean_size, get_alias
+from kodi_six import xbmc, xbmcaddon, py2_encode
+if PY3:
+    from urllib.parse import quote
+    unicode = str
+else:
+    from urllib import quote
 
 def generate_payload(provider, generator, filtering, verify_name=True, verify_size=True):
     """ Payload formatter to format results the way Elementum expects them
@@ -34,7 +41,7 @@ def generate_payload(provider, generator, filtering, verify_name=True, verify_si
     definition = definitions[provider]
     definition = get_alias(definition, get_setting("%s_alias" % provider))
 
-    for name, info_hash, uri, size, seeds, peers in generator:
+    for id, name, info_hash, uri, size, seeds, peers in generator:
         size = clean_size(size)
         # uri, info_hash = clean_magnet(uri, info_hash)
         v_name = name if verify_name else filtering.title
@@ -42,9 +49,10 @@ def generate_payload(provider, generator, filtering, verify_name=True, verify_si
         if filtering.verify(provider, v_name, v_size):
             sort_seeds = get_int(seeds)
             sort_resolution = filtering.determine_resolution(v_name)[1]+1
-            sort_balance = sort_seeds * 3 * sort_resolution
+            sort_balance = (sort_seeds + 1) * 3 * sort_resolution
 
             results.append({
+                "id": id,
                 "name": name,
                 "uri": uri,
                 "info_hash": info_hash,
@@ -58,14 +66,14 @@ def generate_payload(provider, generator, filtering, verify_name=True, verify_si
                 "sort_balance": sort_balance
             })
         else:
-            log.debug(filtering.reason.encode('utf-8'))
+            log.debug(filtering.reason)
 
     log.debug('[%s] >>>>>> %s would send %d torrents to Elementum <<<<<<<' % (provider, provider, len(results)))
 
     return results
 
 
-def process(provider, generator, filtering, has_special, verify_name=True, verify_size=True, skip_auth=False):
+def process(provider, generator, filtering, has_special, verify_name=True, verify_size=True, skip_auth=False, start_time=None, timeout=None):
     """ Method for processing provider results using its generator and Filtering class instance
 
     Args:
@@ -80,10 +88,11 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
     definition = definitions[provider]
     definition = get_alias(definition, get_setting("%s_alias" % provider))
 
-    client = Client(info=filtering.info, request_charset=definition['charset'], response_charset=definition['response_charset'])
+    client = Client(info=filtering.info, request_charset=definition['charset'], response_charset=definition['response_charset'], is_api='is_api' in definition and definition['is_api'])
     token = None
     logged_in = False
     token_auth = False
+    used_queries = set()
 
     if get_setting('kodi_language', bool):
         kodi_language = xbmc.getLanguage(xbmc.ISO_639_1)
@@ -96,25 +105,39 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
     log.debug("[%s] Queries: %s" % (provider, filtering.queries))
     log.debug("[%s] Extras:  %s" % (provider, filtering.extras))
 
-    for query, extra in zip(filtering.queries, filtering.extras):
+    last_priority = 1
+    for query, extra, priority in zip(filtering.queries, filtering.extras, filtering.queries_priorities):
         log.debug("[%s] Before keywords - Query: %s - Extra: %s" % (provider, repr(query), repr(extra)))
         if has_special:
             # Removing quotes, surrounding {title*} keywords, when title contains special chars
             query = re.sub("[\"']({title.*?})[\"']", '\\1', query)
 
-        query = filtering.process_keywords(provider, query)
-        extra = filtering.process_keywords(provider, extra)
+        query = filtering.process_keywords(provider, query, definition)
+        extra = filtering.process_keywords(provider, extra, definition)
 
-        if extra == '-' and filtering.results:
+        if not query:
             continue
+        elif query+extra in used_queries:
+            # Make sure we don't run same query for this provider
+            continue
+        elif priority > last_priority and filtering.results:
+            # Skip fallbacks if there are results
+            log.debug("[%s] Skip fallback as there are already results" % provider)
+            continue
+        elif start_time and timeout and time.time() - start_time + 3 >= timeout:
+            # Stop doing requests if there is 3 seconds left for the overall task
+            continue
+
+        used_queries.add(query+extra)
+        last_priority = priority
 
         try:
             if 'charset' in definition and definition['charset'] and 'utf' not in definition['charset'].lower():
-                query = urllib.quote(query.encode(definition['charset']))
-                extra = urllib.quote(extra.encode(definition['charset']))
+                query = quote(query.encode(definition['charset']))
+                extra = quote(extra.encode(definition['charset']))
             else:
-                query = urllib.quote(query.encode('utf-8'))
-                extra = urllib.quote(extra.encode('utf-8'))
+                query = quote(py2_encode(query))
+                extra = quote(py2_encode(extra))
         except Exception as e:
             log.debug("[%s] Could not quote the query (%s): %s" % (provider, query, e))
             pass
@@ -124,7 +147,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
             return filtering.results
 
         url_search = filtering.url.replace('QUERY', query)
-        if extra and extra != '-':
+        if extra:
             url_search = url_search.replace('EXTRA', extra)
         else:
             url_search = url_search.replace('EXTRA', '')
@@ -141,7 +164,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
             filtering.post_data = eval(definition['post_data'])
 
         payload = dict()
-        for key, value in filtering.post_data.iteritems():
+        for key, value in iteritems(filtering.post_data):
             if 'QUERY' in value:
                 payload[key] = filtering.post_data[key].replace('QUERY', query)
             else:
@@ -153,7 +176,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
         data = None
         if filtering.get_data:
             data = dict()
-            for key, value in filtering.get_data.iteritems():
+            for key, value in iteritems(filtering.get_data):
                 if 'QUERY' in value:
                     data[key] = filtering.get_data[key].replace('QUERY', query)
                 else:
@@ -181,7 +204,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
         elif 'token' in definition:
             token_url = definition['base_url'] + definition['token']
             log.debug("[%s] Getting token for %s at %s" % (provider, provider, repr(token_url)))
-            client.open(token_url.encode('utf-8'))
+            client.open(py2_encode(token_url))
             try:
                 token_data = json.loads(client.content)
             except:
@@ -216,6 +239,10 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
                         except:
                             pass
 
+            if username:
+                client.username = username
+                url_search = url_search.replace('USERNAME', username)
+
             if passkey:
                 logged_in = True
                 client.passkey = passkey
@@ -237,10 +264,10 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
                     log.error("Could not make login headers for %s: %s" % (provider, e))
 
                 # TODO generic flags in definitions for those...
-                if provider == 'hd-torrents':
+                if 'csrf_token' in definition and definition['csrf_token']:
                     client.open(definition['root_url'] + definition['login_path'])
                     if client.content:
-                        csrf_token = re.search(r'name="csrfToken" value="(.*?)"', client.content)
+                        csrf_token = re.search(r'name=\"_?csrf_token\" value=\"(.*?)\"', client.content)
                         if csrf_token:
                             login_object = login_object.replace('CSRF_TOKEN', '"%s"' % csrf_token.group(1))
                         else:
@@ -280,6 +307,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
                         client.open(definition['root_url'] + '/torrents.php')
                         csrf_token = re.search(r'name="csrfToken" value="(.*?)"', client.content)
                         url_search = url_search.replace("CSRF_TOKEN", csrf_token.group(1))
+                    client.save_cookies()
 
         log.info("[%s] >  %s search URL: %s" % (provider, definition['name'].rjust(longest), url_search))
 
@@ -287,7 +315,7 @@ def process(provider, generator, filtering, has_special, verify_name=True, verif
             headers = eval(definition['headers'])
             log.info("[%s] >  %s headers: %s" % (provider, definition['name'].rjust(longest), headers))
 
-        client.open(url_search.encode('utf-8'), post_data=payload, get_data=data, headers=headers)
+        client.open(py2_encode(url_search), post_data=payload, get_data=data, headers=headers)
         filtering.results.extend(
             generate_payload(provider,
                              generator(provider, client),
